@@ -224,6 +224,12 @@ def delete_suffixed(filename):
 def keep_suffixed(filename):
     return "%s%s" % (filename, KEEP_SUFFIX)
 
+def copy_owner_and_permissions(srcdir, dstdir):
+    """Set the owner/group/permissions bits on dstdir according to srcdir."""
+    s = os.stat(srcdir)
+    os.chown(dstdir, s.st_uid, s.st_gid)
+    shutil.copystat(srcdir, dstdir)
+
 #
 # incron event handling
 #
@@ -232,6 +238,8 @@ def handle_mkdir(rootfs, rootdir, new_fs, new_dir, all_zfs, options):
     log_debug("handle_mkdir(%s, %s)" % (new_dir, new_fs))
     # create in a staging area
     zfs_create(staging_suffixed(new_fs))
+    # set owner/group/permissions
+    copy_owner_and_permissions(new_dir, staging_suffixed(new_dir))
     # copy in files
     rsync_dir(new_dir, staging_suffixed(new_dir))
     # rename old directory
