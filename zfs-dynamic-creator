@@ -1,0 +1,322 @@
+#!/usr/bin/env python
+#
+# Incron based script to create ZFS filesystems automatically on mkdir
+# See README.md for details.
+#
+# Simon Guest, 13/6/2014
+# Licensed under GPLv3
+
+import optparse
+import os
+import os.path
+import re
+import shutil
+import subprocess
+import sys
+import syslog
+from syslog import LOG_ERR, LOG_DEBUG
+import time
+import traceback
+
+#
+# Logging
+#
+
+def log(message):
+    sys.stderr.write("INFO: %s\n" % message)
+    syslog.syslog(message)
+
+def log_error(message):
+    sys.stderr.write("ERROR: %s\n" % message)
+    syslog.syslog(LOG_ERR, "ERROR: %s\n" % message)
+
+def log_debug(message):
+    sys.stderr.write("DEBUG: %s\n" % message)
+    syslog.syslog(LOG_DEBUG, "DEBUG: %s\n" % message)
+#
+# ZFS helper functions
+#
+class ZFSError(Exception):
+    def __init__(self, rc, msg):
+        self.rc = rc
+        self.msg = msg
+        
+def zfs_popen(args):
+    """Generator to run zfs command with given arguments, yielding newline-stripped lines from stdout."""
+    log_debug("running zfs %s" % ' '.join(args))
+    zpipe = subprocess.Popen(["zfs"] + args, stdout = subprocess.PIPE, stderr = subprocess.PIPE)
+    for line in zpipe.stdout:
+        yield line.rstrip('\n')
+    zpipe.wait()
+    if zpipe.returncode != 0:
+        log_error("zfs %s failed - " % (' '.join(args), str(zpipe.stderr)))
+        raise ZFSError(zpipe.returncode, str(zpipe.stderr))
+
+def zfs(args):
+    """Run zfs command with given arguments."""
+    log_debug("running zfs %s" % ' '.join(args))
+    zpipe = subprocess.Popen(["zfs"] + args, stderr = subprocess.PIPE)
+    zpipe.wait()
+    if zpipe.returncode != 0:
+        error_string = "; ".join([line.rstrip('\n') for line in zpipe.stderr.readlines()])
+        log_error("zfs %s failed - %s" % (' '.join(args), error_string))
+        raise ZFSError(zpipe.returncode, error_string)
+
+def zfs_list():
+    """Generator to list ZFS filesystems."""
+    for line in zfs_popen(["list", "-H"]):
+        yield line.split()[0]
+ 
+def zfs_create(fs):
+    log("zfs create %s" % fs)
+    zfs(["create", fs])
+
+#
+# /etc/exports maintenance
+#
+
+class Exports:
+    """Naive exports file maintenance.
+
+    Naive in these respects:
+    * ignores whitespace quoting
+    * ignores line continuation
+    """
+    def __init__(self, file = "/etc/exports"):
+        self.file = file
+        self.read()
+
+    def read(self):
+        self.exports = {}
+        with open(self.file) as exports_f:
+            for line in exports_f:
+                line = line.rstrip('\n')
+                m = re.match(r"([^#]\S+)\s+(.*)$", line)
+                if m:
+                    export_point = m.group(1)
+                    clients = m.group(2)
+                    self.exports[export_point] = clients
+
+    def has_export_point(self, export_point):
+        return self.exports.has_key(export_point)
+
+    def export_points(self):
+        return self.exports.keys()
+
+    def clients(self, export_point):
+        return self.exports[export_point]
+
+    def update(self, export_point, clients):
+        """Make an update, to be written during commit()."""
+        self.exports[export_point] = clients
+
+    def delete(self, export_point):
+        """Make a deletion, to be written during commit()."""
+        del self.exports[export_point]
+
+    def commit(self):
+        """Commit updates and deletions to exports file."""
+        changed = False
+        newfile = self.file + ".new"
+        written = {}
+        with open(self.file) as exports_f:
+            with open(newfile, "w") as new_f:
+                for line in exports_f:
+                    line = line.rstrip('\n')
+                    m = re.match(r"([^#]\S+)\s+(.*)$", line)
+                    if m:
+                        export_point = m.group(1)
+                        clients = m.group(2)
+                        if not self.exports.has_key(export_point):
+                            # deleted, don't write it
+                            changed = True
+                        elif self.exports[export_point] != clients:
+                            # updated, write new version
+                            new_f.write("%s %s\n" % (export_point, self.exports[export_point]))
+                            written[export_point] = True
+                            changed = True
+                        else:
+                            # unchanged, write it straight back out
+                            new_f.write("%s\n" % line)
+                            written[export_point] = True
+                    else:
+                        # write it straight back out
+                        new_f.write("%s\n" % line)
+                # write out the new ones
+                for export_point in self.exports.keys():
+                    if not written.has_key(export_point):
+                        new_f.write("%s %s\n" % (export_point, self.exports[export_point]))
+                        changed = True
+
+        if changed:
+            os.rename(newfile, self.file)
+            log("exportfs -r")
+            subprocess.call(["exportfs", "-r"])
+        else:
+            os.unlink(newfile)
+
+def is_descendent(d, root):
+    """For either ZFS filesystems, or directories, return whether d is a strict descendent."""
+    return d.startswith(root + '/')
+
+def fs2dir(fs, rootfs, rootdir):
+    return fs.replace(rootfs, rootdir, 1)
+
+def dir2fs(d, rootfs, rootdir):
+    return d.replace(rootdir, rootfs, 1)
+
+def update_exports(rootfs, rootdir, new_fss, all_zfs, options, exportsfile = "/etc/exports"):
+    """Update /etc/exports (or as specified) to match ZFS filesystems.
+
+    If rootdir appears in the exportsfile, then:
+    Children of rootdir without filesystems under rootfs are removed;
+    Any children of rootfs are updated in exports file, with same options as rootdir.
+
+    Otherwise, do nothing.
+    """
+    exports = Exports(exportsfile)
+    if rootdir in exports.export_points():
+        if options.add_remove_all_exports:
+            child_export_points = [fs2dir(fs, rootfs, rootdir) for fs in all_zfs if is_descendent(fs, rootfs)]
+        elif options.add_export:
+            child_export_points = [fs2dir(fs, rootfs, rootdir) for fs in new_fss if is_descendent(fs, rootfs)]
+        else:
+            child_export_points = []
+        rootdir_clients = exports.clients(rootdir)
+        if options.add_remove_all_exports:
+            # delete unwanted exports
+            for ep in exports.export_points():
+                if is_descendent(ep, rootdir) and ep not in child_export_points:
+                    log("delete entry for %s from %s" % (ep, exportsfile))
+                    exports.delete(ep)
+        # define exports we want
+        for cep in child_export_points:
+            if not exports.has_export_point(cep) or exports.clients(cep) != rootdir_clients:
+                log("update entry for %s in %s" % (cep, exportsfile))
+                exports.update(cep, rootdir_clients)
+        exports.commit()
+    
+#
+# other helper functions
+#
+
+def rsync_dir(src, dst):
+    # ensure directories end with slash, for correct rsync behaviour
+    if not src.endswith('/'):
+        src = "%s/" % src
+    if not dst.endswith('/'):
+        dst = "%s/" % dst
+    log("rsync -a -X --delete %s %s" % (src, dst))
+    rc = subprocess.call(["rsync", "-a", "-X", "--delete", src, dst])
+    if rc != 0:
+        log_error("rsync failed")
+
+FINAL_SUFFIX=".zfs-dynamic-creator"
+STAGING_SUFFIX=".fs%s" % FINAL_SUFFIX
+DELETE_SUFFIX=".delete%s" % FINAL_SUFFIX
+KEEP_SUFFIX=".keep%s" % FINAL_SUFFIX
+def is_suffixed(filename):
+    return filename.endswith(FINAL_SUFFIX)
+def staging_suffixed(filename):
+    return "%s%s" % (filename, STAGING_SUFFIX)
+def delete_suffixed(filename):
+    return "%s%s" % (filename, DELETE_SUFFIX)
+def keep_suffixed(filename):
+    return "%s%s" % (filename, KEEP_SUFFIX)
+
+#
+# incron event handling
+#
+
+def handle_mkdir(rootfs, rootdir, new_fs, new_dir, all_zfs, options):
+    log_debug("handle_mkdir(%s, %s)" % (new_dir, new_fs))
+    # create in a staging area
+    zfs_create(staging_suffixed(new_fs))
+    # copy in files
+    rsync_dir(new_dir, staging_suffixed(new_dir))
+    # rename old directory
+    log("mv %s %s" % (new_dir, delete_suffixed(new_dir)))
+    os.rename(new_dir, delete_suffixed(new_dir))
+    # rename filesystem
+    log("zfs rename %s %s" % (staging_suffixed(new_fs), new_fs))
+    zfs(["rename", staging_suffixed(new_fs), new_fs])
+    # record new filesystem
+    all_zfs.append(new_fs)
+    # update exports
+    update_exports(rootfs, rootdir, [new_fs], all_zfs, options)
+
+def handle_rename_as_final(rootfs, rootdir, filename, options):
+    log_debug("handle_rename_as_final(%s, %s, %s)" % (rootfs, rootdir, filename))
+    delete_dir = os.path.join(rootdir, delete_suffixed(filename))
+    if os.path.isdir(delete_dir):
+        log("rmtree %s" % delete_dir)
+        shutil.rmtree(delete_dir)
+
+def is_matching_dir(filename, options):
+    """Return whether the filename is selected by matching regexp, or True if no option passed."""
+    matched = options.only_dirs_matching == None or (re.search(options.only_dirs_matching, filename) != None)
+    log_debug("is_matching_dir(%s, %s) = %s" % (filename, str(options.only_dirs_matching), str(matched)))
+    return matched
+
+def handle_event(rootfs, rootdir, filename, event, options):
+    """Handle incron events.  We only get to see those enabled in the incrontab.
+
+    Ignore any events to do with suffixed filenames, as these are secondary events caused by this script's actions.
+    """
+    log_debug("handle_event(%s, %s, %s, %s)" % (rootfs, rootdir, filename, event))
+    event_flags = event.split(',')
+    if "IN_CREATE" in event_flags and "IN_ISDIR" in event_flags and not is_suffixed(filename):
+
+        if is_matching_dir(filename, options):
+            # check if it's a secondary event caused by this script's actions
+            if os.path.isdir(os.path.join(rootdir, delete_suffixed(filename))) or os.path.isdir(os.path.join(rootdir, keep_suffixed(filename))):
+                handle_rename_as_final(rootfs, rootdir, filename, options)
+            else:
+                new_fs = os.path.join(rootfs, filename)
+                new_dir = os.path.join(rootdir, filename)
+                all_zfs = list(zfs_list())
+                if not new_fs in all_zfs:
+                    log("processing new directory %s in %s in %d seconds" % (filename, rootdir, options.delay))
+                    if options.delay > 0:
+                        time.sleep(options.delay)
+                    handle_mkdir(rootfs, rootdir, new_fs, new_dir, all_zfs, options)
+                else:
+                    log_debug("filesystem %s exists - ignoring" % new_fs)
+        else:
+            log("new directory %s in %s fails to match '%s' - ignored" % (filename, rootdir, options.only_dirs_matching))
+
+    else:
+        log_debug("uninteresting event - ignoring")
+
+#
+# main program
+#
+
+def main():
+    parser = optparse.OptionParser(usage="%prog [options] <rootfs> <rootdir> [<filename> <event>]")
+    parser.add_option("--delay", action="store", type="int", default=0, help="delay in seconds before acting on incron event")
+    parser.add_option("--add-export", action="store_true", default=False, help="add NFS exports entry for new filesystem(s)")
+    parser.add_option("--add-remove-all-exports", action="store_true", default=False, help="ensure NFS exports entries match child filesystems")
+    parser.add_option("--only-dirs-matching", action="store", type="string", help="regexp to select directories of interest")
+    parser.add_option("-q", "--quiet", action="store_true", default=False, help="run quiet")
+    (options, args) = parser.parse_args(sys.argv)
+
+    try:
+        syslog.openlog("zfs-dynamic-creator")
+        if len(args) - 1 == 2:
+            rootfs, rootdir = args[1:]
+            all_zfs = list(zfs_list())
+            update_exports(rootfs, rootdir, [], all_zfs, options)
+        elif len(args) - 1 == 4:
+            rootfs, rootdir, filename, event = args[1:]
+            handle_event(rootfs, rootdir, filename, event, options)
+        else:
+            sys.stderr.write("%s\n" % parser.get_usage())
+            log_error("bad arguments(%d): %s" % (len(args) - 1, ' '.join(sys.argv[1:])))
+            sys.exit(1)
+    except Exception as e:
+        errstr = "EXCEPTION: %s\n%s" % (str(e), traceback.format_exc())
+        log_error(errstr)
+
+if __name__ == '__main__':
+    main()
