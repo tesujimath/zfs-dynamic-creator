@@ -201,6 +201,8 @@ def update_exports(rootfs, rootdir, new_fss, all_zfs, options, exportsfile = "/e
 #
 
 def rsync_dir(src, dst):
+    # set owner/group/permissions at top-level
+    copy_owner_and_permissions(src, dst)
     # ensure directories end with slash, for correct rsync behaviour
     if not src.endswith('/'):
         src = "%s/" % src
@@ -224,11 +226,11 @@ def delete_suffixed(filename):
 def keep_suffixed(filename):
     return "%s%s" % (filename, KEEP_SUFFIX)
 
-def copy_owner_and_permissions(srcdir, dstdir):
-    """Set the owner/group/permissions bits on dstdir according to srcdir."""
-    s = os.stat(srcdir)
-    os.chown(dstdir, s.st_uid, s.st_gid)
-    shutil.copystat(srcdir, dstdir)
+def copy_owner_and_permissions(src, dst):
+    """Set the owner/group/permissions bits on dst according to src."""
+    s = os.stat(src)
+    os.chown(dst, s.st_uid, s.st_gid)
+    shutil.copystat(src, dst)
 
 #
 # incron event handling
@@ -238,8 +240,6 @@ def handle_mkdir(rootfs, rootdir, new_fs, new_dir, all_zfs, options):
     log_debug("handle_mkdir(%s, %s)" % (new_dir, new_fs))
     # create in a staging area
     zfs_create(staging_suffixed(new_fs))
-    # set owner/group/permissions
-    copy_owner_and_permissions(new_dir, staging_suffixed(new_dir))
     # copy in files
     rsync_dir(new_dir, staging_suffixed(new_dir))
     # rename old directory
