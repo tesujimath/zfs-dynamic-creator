@@ -9,6 +9,15 @@ to create a ZFS filesystem for each run of an Illumina HiSeq
 sequencing machine, in response to the sequencing machine creating a
 directory on the fileserver.
 
+**IMPORTANT NOTE**: The approach taken by this script does not provide
+a general solution.  It relies critically on a known period of
+quiescence in the affected filesystem tree, during which the
+operations below are performed.  If there is filesystem activity there
+during this period, data loss is likely.  The approach here is
+inherently racy, and no amount of tweaking of steps 1 to 6 below can
+fix this.  That might not matter in your scenario, but be careful not
+to deploy this script naively.
+
 The approach is as follows:
 
 1. Incron watches a directory for changes according to incrontab rules.
